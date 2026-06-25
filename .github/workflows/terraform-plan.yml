@@ -1,0 +1,148 @@
+name: terraform-plan
+
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - main
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write   # required to mint GitHub OIDC JWT
+      contents: read
+      pull-requests: write
+    env:
+      VAULT_ADDR: ${{ vars.VAULT_ADDR || 'https://hcp-vault-hashistack-dev-public-vault-07d7a072.25a5443c.z1.hashicorp.cloud:8200' }}
+      VAULT_NAMESPACE: ${{ vars.VAULT_NAMESPACE || 'admin' }}
+      VAULT_AUTH_PATH: ${{ vars.VAULT_GITHUB_JWT_AUTH_PATH || 'github-jwt' }}
+      VAULT_ROLE: ${{ vars.VAULT_AWS_INFRA_PLAN_ROLE || 'aws-infra-plan' }}
+      VAULT_AWS_BACKEND: ${{ vars.VAULT_AWS_CI_BACKEND_PATH || 'aws-ci' }}
+      VAULT_AWS_ROLE: ${{ vars.VAULT_AWS_CI_ROLE_NAME || 'github-actions-ci' }}
+      VAULT_AUDIENCE: ${{ vars.VAULT_GITHUB_OIDC_AUDIENCE || 'vault' }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'eu-west-2' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Exchange GitHub OIDC JWT for Vault token
+        id: vault-login
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUEST_URL="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${VAULT_AUDIENCE}"
+          GITHUB_JWT="$(curl -sSf \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${REQUEST_URL}" | jq -r '.value')"
+
+          if [[ -z "${GITHUB_JWT}" || "${GITHUB_JWT}" == "null" ]]; then
+            echo "::error::Failed to mint GitHub OIDC JWT."
+            exit 1
+          fi
+          echo "::add-mask::${GITHUB_JWT}"
+
+          HEADERS=(-H "Content-Type: application/json")
+          [[ -n "${VAULT_NAMESPACE:-}" ]] && HEADERS+=(-H "X-Vault-Namespace: ${VAULT_NAMESPACE}")
+
+          PAYLOAD="$(jq -n --arg role "${VAULT_ROLE}" --arg jwt "${GITHUB_JWT}" '{role:$role,jwt:$jwt}')"
+          RESPONSE="$(curl -sSf "${HEADERS[@]}" \
+            --request POST --data "${PAYLOAD}" \
+            "${VAULT_ADDR}/v1/auth/${VAULT_AUTH_PATH}/login")"
+
+          VAULT_TOKEN="$(echo "${RESPONSE}" | jq -r '.auth.client_token')"
+          if [[ -z "${VAULT_TOKEN}" || "${VAULT_TOKEN}" == "null" ]]; then
+            echo "::error::Vault login failed. Check the aws-infra-plan role bound_claims."
+            exit 1
+          fi
+          echo "::add-mask::${VAULT_TOKEN}"
+          echo "VAULT_TOKEN=${VAULT_TOKEN}" >> "${GITHUB_ENV}"
+          echo "Vault login successful."
+
+      - name: Retrieve short-lived AWS credentials from Vault
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # NOTE: This step requires the Vault → AWS WIF bootstrap to be complete (issue #30
+          # in adamfitzhugh/hcp-vault-hashistack-dev). Until then, this step will fail with
+          # a 404 as the aws-ci backend is not yet mounted.
+
+          HEADERS=(-H "X-Vault-Token: ${VAULT_TOKEN}")
+          [[ -n "${VAULT_NAMESPACE:-}" ]] && HEADERS+=(-H "X-Vault-Namespace: ${VAULT_NAMESPACE}")
+
+          CREDS="$(curl -sSf "${HEADERS[@]}" \
+            "${VAULT_ADDR}/v1/${VAULT_AWS_BACKEND}/creds/${VAULT_AWS_ROLE}")"
+
+          AWS_ACCESS_KEY_ID="$(echo "${CREDS}" | jq -r '.data.access_key')"
+          AWS_SECRET_ACCESS_KEY="$(echo "${CREDS}" | jq -r '.data.secret_key')"
+          AWS_SESSION_TOKEN="$(echo "${CREDS}" | jq -r '.data.security_token')"
+
+          if [[ -z "${AWS_ACCESS_KEY_ID}" || "${AWS_ACCESS_KEY_ID}" == "null" ]]; then
+            echo "::error::Vault did not return AWS credentials. Is the aws-ci backend mounted?"
+            exit 1
+          fi
+
+          echo "::add-mask::${AWS_ACCESS_KEY_ID}"
+          echo "::add-mask::${AWS_SECRET_ACCESS_KEY}"
+          echo "::add-mask::${AWS_SESSION_TOKEN}"
+          {
+            echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
+            echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+            echo "AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
+          } >> "${GITHUB_ENV}"
+
+          aws sts get-caller-identity --output json | jq '{Account,Arn,UserId}'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "${GITHUB_OUTPUT}"
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan_output.txt', 'utf8');
+            const maxLen = 65000;
+            const truncated = plan.length > maxLen
+              ? plan.substring(0, maxLen) + '\n\n... (truncated)'
+              : plan;
+            const body = `## Terraform Plan\n\n<details><summary>Show Plan</summary>\n\n\`\`\`terraform\n${truncated}\n\`\`\`\n\n</details>`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Revoke Vault token
+        if: always()
+        shell: bash
+        run: |
+          [[ -z "${VAULT_TOKEN:-}" ]] && exit 0
+          HEADERS=(-H "X-Vault-Token: ${VAULT_TOKEN}")
+          [[ -n "${VAULT_NAMESPACE:-}" ]] && HEADERS+=(-H "X-Vault-Namespace: ${VAULT_NAMESPACE}")
+          curl -sSf "${HEADERS[@]}" --request POST \
+            "${VAULT_ADDR}/v1/auth/token/revoke-self" >/dev/null
+          echo "Vault token revoked."
